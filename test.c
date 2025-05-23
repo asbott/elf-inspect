@@ -111,73 +111,122 @@ typedef struct __attribute__((packed)) Elf_Header_Header {
     Elf_Header64 impl;
 } Elf_Header_Header;
 
-static size_t decode_x86_64_len(const u8 *p, const u8 *end) {
-    const u8 *start = p;
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
 
-    while (p < end && 
-           ((*p & 0xF0) == 0x40 || 
-            *p == 0xF0 || *p == 0xF2 || *p == 0xF3 ||
-            *p == 0x2E || *p == 0x36 || *p == 0x3E || *p == 0x26 ||
-            *p == 0x64 || *p == 0x65 || *p == 0x66 || *p == 0x67)) {
-        p++;
+static size_t decode_x86_64_len(const uint8_t *p, const uint8_t *end) {
+    const uint8_t *start = p;
+
+    // ——— Single-byte fast-paths ———
+    if (p < end) {
+        switch (*p) {
+        case 0x55: // push rbp
+        case 0x5D: // pop  rbp
+        case 0xC3: // ret
+            return 1;
+        }
     }
-    if (p >= end) return p - start;
 
-    u8 opcode = *p++;
+    // ——— Step 1: skip all prefixes ———
+    while (p < end) {
+        uint8_t b = *p;
+        // REX: 0x40–0x4F
+        if ((b & 0xF0) == 0x40 ||
+            // legacy: lock/rep, segment, operand-/address-size
+            b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+            b == 0x2E || b == 0x36 || b == 0x3E ||
+            b == 0x26 || b == 0x64 || b == 0x65 ||
+            b == 0x66 || b == 0x67) {
+            p++;
+            continue;
+        }
+        break;
+    }
+    if (p >= end)
+        return p - start;
+
+    // ——— Step 2: opcode byte(s) ———
     bool two_byte = false;
+    uint8_t opcode = *p++;
     if (opcode == 0x0F) {
         two_byte = true;
         if (p >= end) return p - start;
         opcode = *p++;
     }
 
-    bool needs_modrm = true;
-    if ((!two_byte && (opcode >= 0xB8 && opcode <= 0xBF)) || // MOV r64, imm32
-        (!two_byte && (opcode >= 0x70 && opcode <= 0x7F)) || // Jcc rel8
-        (!two_byte && opcode == 0xEB) ||                     // JMP rel8
-        (!two_byte && opcode == 0xE8) ||                     // CALL rel32
-        (!two_byte && opcode == 0xE9))                       // JMP rel32
-    {
-        needs_modrm = false;
+    // ——— Fast RET-imm16 and RETF-imm16 ———
+    if (!two_byte && (opcode == 0xC2 || opcode == 0xCA)) {
+        // C2 = RET imm16, CA = RETF imm16
+        if (p + 2 <= end) p += 2;
+        return p - start;
     }
 
-    if (needs_modrm && p < end) {
-        u8 modrm = *p++;
-        u8 mod = (modrm >> 6) & 3;
-        u8 rm  = modrm & 7;
+    // ——— Step 3: modR/M? ———
+    bool needs_modrm = true;
+    if (!two_byte) {
+        // immediate-only opcodes — no ModR/M
+        if ((opcode >= 0xB8 && opcode <= 0xBF) ||  // MOV r64, imm32
+            (opcode >= 0x70 && opcode <= 0x7F) ||  // Jcc rel8
+            opcode == 0xEB ||                      // JMP rel8
+            opcode == 0xE8 ||                      // CALL rel32
+            opcode == 0xE9)                        // JMP rel32
+        {
+            needs_modrm = false;
+        }
+    }
 
+    // ——— Step 4: parse ModR/M + SIB + disp ———
+    if (needs_modrm && p < end) {
+        uint8_t modrm = *p++;
+        uint8_t mod   = (modrm >> 6) & 3;
+        uint8_t rm    = modrm & 7;
+
+        // SIB
         if (mod != 3 && rm == 4 && p < end) {
             p++;
         }
-
+        // disp8
         if (mod == 1 && p + 1 <= end) {
             p += 1;
-        } else if (mod == 2 && p + 4 <= end) {
+        }
+        // disp32
+        else if (mod == 2 && p + 4 <= end) {
             p += 4;
-        } else if (mod == 0 && rm == 5 && p + 4 <= end) {
+        }
+        // RIP-relative
+        else if (mod == 0 && rm == 5 && p + 4 <= end) {
             p += 4;
         }
     }
 
+    // ——— Step 5: immediates for the no-ModR/M opcodes ———
     if (!needs_modrm) {
-        if (opcode >= 0x70 && opcode <= 0x7F) {
+        // Jcc rel8, JMP rel8
+        if ((opcode >= 0x70 && opcode <= 0x7F) || opcode == 0xEB) {
             if (p < end) p += 1;
-        } else if (opcode == 0xEB) {
-            if (p < end) p += 1;
-        } else if (opcode == 0xE8 || opcode == 0xE9) {
-            if (p + 4 <= end) p += 4;
-        } else if (opcode >= 0xB8 && opcode <= 0xBF) {
+        }
+        // CALL rel32, JMP rel32, MOV r64, imm32
+        else if (opcode == 0xE8 || opcode == 0xE9 ||
+                 (opcode >= 0xB8 && opcode <= 0xBF)) {
             if (p + 4 <= end) p += 4;
         }
-    } else {
-        if (!two_byte && (opcode == 0x83 || opcode == 0xC7)) {
-            if (opcode == 0x83 && p < end)         p += 1;
-            if (opcode == 0xC7 && p + 4 <= end)   p += 4;
+    }
+    // ——— Step 6: two-operand IMMs for common ModR/M cases ———
+    else if (!two_byte && (opcode == 0x83 || opcode == 0xC7)) {
+        if (opcode == 0x83 && p < end) {
+            // 83 /0–/7: imm8
+            p += 1;
+        }
+        else if (opcode == 0xC7 && p + 4 <= end) {
+            // C7 /0: imm32
+            p += 4;
         }
     }
 
     return p - start;
 }
+
 
 int main(void) {
     
